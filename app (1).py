@@ -152,32 +152,43 @@ for s in candidates:
 
 rows.sort(key=lambda x: x["dist_pct"])
 
-in_zone    = [r for r in rows if r["dist_pct"] <= 0]
-near_zone  = [r for r in rows if 0 < r["dist_pct"] <= prox]
+# dist_pct = (live / crash_buy - 1) * 100
+# dist > 0   → price ABOVE crash buy (stock hasn't dropped to zone yet)
+# dist ~= 0  → price RIGHT AT crash buy (GTC fires here)
+# dist < 0   → price BELOW crash buy (already crashed past the zone)
+#
+# Buckets:
+#   🟢 IN ZONE     : within ±3% of crash buy  (-3% to +3%)
+#   🟡 APPROACHING : above zone, within prox%  (+3% to +prox%)
+#   🔵 BELOW ZONE  : already crashed past zone (< -3%)  ← separate section
+
+in_zone    = [r for r in rows if -3 <= r["dist_pct"] <= 3]
+near_zone  = [r for r in rows if 3  <  r["dist_pct"] <= prox]
+below_zone = [r for r in rows if r["dist_pct"] < -3]
 
 # ─── SUMMARY METRICS ─────────────────────────────────────────────────────────
 c1, c2, c3 = st.columns(3)
-c1.metric("🟢 In Buy Zone",    len(in_zone))
+c1.metric("🟢 In Zone ±3%",    len(in_zone))
 c2.metric("🟡 Approaching",    len(near_zone))
-c3.metric("📊 Scanned",        len(rows))
+c3.metric("🔵 Below Zone",     len(below_zone))
 
 st.divider()
 
 # ─── RENDER CARDS ────────────────────────────────────────────────────────────
-def render_card(r):
+def render_card(r, mode="zone"):
     dist = r["dist_pct"]
-    if dist <= 0:
+    if mode == "below":
+        css = "card-red"
+        dist_color = "red"
+        icon = "🔵"
+    elif mode == "zone":
         css = "card-green"
         dist_color = "green"
         icon = "🟢"
-    elif dist <= 5:
+    else:
         css = "card-yellow"
         dist_color = "yellow"
         icon = "🟡"
-    else:
-        css = "card"
-        dist_color = "yellow"
-        icon = "⏳"
 
     sign = "+" if dist > 0 else ""
     above = "↑200DMA" if r["above_200"] else "↓200DMA"
@@ -190,7 +201,7 @@ def render_card(r):
         <span class="tier">{r["tier"]}</span>
         <span class="tier" style="background:#1a2a40;color:#94a3b8">{above}</span>
       </div>
-      <div class="dist {dist_color}">{sign}{dist:.2f}% to zone</div>
+      <div class="dist {dist_color}">{sign}{dist:.2f}% to crash buy</div>
       <div class="meta">Score {r["score"]} · R:R {r["rr"]} · Win {int(r["win_pct"])}% · {r["rot_yr"]}×/yr</div>
       <div class="price-row">
         <div>
@@ -231,21 +242,29 @@ def render_card(r):
     </div>
     """, unsafe_allow_html=True)
 
-# IN ZONE
+# ── 🟢 IN ZONE ───────────────────────────────────────────────────────────────
 if in_zone:
-    st.markdown(f"### 🟢 In Buy Zone ({len(in_zone)})")
-    st.caption("GTC should already be set — verify orders are active")
+    st.markdown(f"### 🟢 In Buy Zone — ±3% of crash buy ({len(in_zone)})")
+    st.caption("Price is right at the GTC level — verify your orders are active")
     for r in in_zone[:20]:
-        render_card(r)
+        render_card(r, mode="zone")
 else:
-    st.info("No stocks in buy zone right now.")
+    st.info("No stocks within ±3% of crash buy zone right now.")
 
-# APPROACHING
+# ── 🟡 APPROACHING ───────────────────────────────────────────────────────────
 if near_zone:
-    st.markdown(f"### 🟡 Approaching — within {prox}% ({len(near_zone)})")
-    st.caption("Set GTC orders for these now")
+    st.markdown(f"### 🟡 Approaching — within {prox}% above crash buy ({len(near_zone)})")
+    st.caption("Still above the zone — set GTC orders now so you don't miss the entry")
     for r in near_zone[:25]:
-        render_card(r)
+        render_card(r, mode="approach")
+
+# ── 🔵 BELOW ZONE ────────────────────────────────────────────────────────────
+with st.expander(f"🔵 Below Zone — already crashed past crash buy ({len(below_zone)})"):
+    st.caption("These stocks have fallen below their crash buy price. "
+               "Could be deep value plays — but recalculate levels before acting. "
+               "Don't chase blindly.")
+    for r in below_zone[:30]:
+        render_card(r, mode="below")
 
 # ─── FOOTER ──────────────────────────────────────────────────────────────────
 st.divider()
