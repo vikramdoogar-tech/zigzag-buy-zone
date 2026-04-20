@@ -7,7 +7,7 @@ from datetime import datetime
 
 # ─── LOAD DATA FROM GITHUB ───────────────────────────────────────────────────
 # These files are in your zigzag-buy-zone GitHub repo
-GITHUB_RAW = "https://raw.githubusercontent.com/vikramdoogar-tech/zigzag-buy-zone/main/"
+GITHUB_RAW = "https://raw.githubusercontent.com/YOUR_USERNAME/zigzag-buy-zone/main/"
 
 @st.cache_data(ttl=3600)
 def load_json(filename):
@@ -159,6 +159,10 @@ with tab1:
             <div class="pcol"><div class="plbl">SL</div><div class="pval" style="color:#ef4444">₹{r["sl"]:,.2f}</div></div>
             <div class="pcol"><div class="plbl">TARGET</div><div class="pval" style="color:#2dd4bf">₹{r["rot_target"]:,.2f}</div></div>
             <div class="pcol"><div class="plbl">UPSIDE</div><div class="pval" style="color:#22c55e">+{r["up"]}%</div></div>
+            <div class="pcol"><div class="plbl">⏱ RISE DAYS</div><div class="pval" style="color:#fbbf24">~{int(r.get("rise_days",0))}d</div></div>
+            <div class="pcol"><div class="plbl">DROP DAYS</div><div class="pval" style="color:#94a3b8">~{int(r.get("drop_days",0))}d</div></div>
+            <div class="pcol"><div class="plbl">🕐 ELAPSED EST</div><div class="pval" style="color:#c084fc">{"~"+str(round(max(0,(r["live"]/r["crash_buy"]-1)*100/r.get("rise_speed",1)),1))+"d" if r.get("rise_speed",0)>0 else "Day 0"}</div></div>
+            <div class="pcol"><div class="plbl">⏳ DAYS LEFT</div><div class="pval" style="color:#2dd4bf">{"~"+str(round(max(0,(r["rot_target"]/r["live"]-1)*100/r.get("rise_speed",1)),1))+"d" if r.get("rise_speed",0)>0 and r["live"]<r["rot_target"] else "✅ At target"}</div></div>
           </div></div>""", unsafe_allow_html=True)
 
     if in_z:
@@ -243,6 +247,9 @@ with tab2:
             <div class="pcol"><div class="plbl">SL</div><div class="pval" style="color:#ef4444">₹{r["sl"]:,.2f}</div></div>
             <div class="pcol"><div class="plbl">TARGET</div><div class="pval" style="color:#2dd4bf">₹{r["target"]:,.2f}</div></div>
             <div class="pcol"><div class="plbl">UPSIDE</div><div class="pval" style="color:#22c55e">+{r["up_scan"]}%</div></div>
+            <div class="pcol"><div class="plbl">⏱ RISE DAYS</div><div class="pval" style="color:#fbbf24">~{int(r.get("rdays",0))}d</div></div>
+            <div class="pcol"><div class="plbl">DROP DAYS</div><div class="pval" style="color:#94a3b8">~{int(r.get("ddays",0))}d</div></div>
+            <div class="pcol"><div class="plbl">⏳ DAYS TO TGT</div><div class="pval" style="color:#2dd4bf">{"~"+str(round(max(0,(r["target"]/r["price"]-1)*100/r["speed"]),1))+"d" if r.get("speed",0)>0 and r["target"]>r["price"] else "—"}</div></div>
           </div></div>""", unsafe_allow_html=True)
 
     MAX=40
