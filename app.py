@@ -117,10 +117,9 @@ with tab1:
             and (not above_only or s["above_200"])
             and (not sectors or s.get("sector","") in sectors)]
 
-    with st.spinner(f"Fetching {len(pool)} live prices…"):
-        live = get_prices(tuple(s["sym"] for s in pool))
+    live = get_prices(tuple(s["sym"] for s in pool))
 
-    st.success(f"✓ {len(live)}/{len(pool)} prices — {datetime.now().strftime('%H:%M:%S')} IST")
+    st.caption(f"✓ {len(live)}/{len(pool)} prices loaded — {datetime.now().strftime('%H:%M:%S')} IST")
 
     rows = []
     for s in pool:
@@ -285,10 +284,9 @@ with tab2:
 # ══════════════════════════════════════════════════════════════════════════════
 with tab3:
     wl_syms = tuple(w["sym"] for w in MY_WATCHLIST)
-    with st.spinner(f"Loading {len(wl_syms)} portfolio stocks…"):
-        wl_live = get_prices(wl_syms)
+    wl_live = get_prices(wl_syms)
 
-    st.success(f"✓ {len(wl_live)}/{len(wl_syms)} — {datetime.now().strftime('%H:%M:%S')} IST")
+    st.caption(f"✓ {len(wl_live)}/{len(wl_syms)} loaded — {datetime.now().strftime('%H:%M:%S')} IST")
 
     inv=0; cur=0; win3=0; los3=0
     for w in MY_WATCHLIST:
