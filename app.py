@@ -7,18 +7,32 @@ from datetime import datetime
 
 # ─── LOAD DATA FROM GITHUB ───────────────────────────────────────────────────
 # These files are in your zigzag-buy-zone GitHub repo
-GITHUB_RAW = "https://raw.githubusercontent.com/YOUR_USERNAME/zigzag-buy-zone/main/"
+# ── Auto-detect GitHub repo from Streamlit's running URL ─────────────────────
+import os
+_repo_url = os.environ.get("STREAMLIT_SERVER_BASE_URL_PATH", "")
+# Fallback: hardcode your GitHub username below if auto-detect fails
+GITHUB_USER = "vikramdoogar-tech"   # ← your GitHub username
+GITHUB_REPO = "zigzag-buy-zone"
+GITHUB_RAW  = f"https://raw.githubusercontent.com/{GITHUB_USER}/{GITHUB_REPO}/main/"
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=3600, show_spinner=False)
 def load_json(filename):
-    url = GITHUB_RAW + filename
-    r = requests.get(url, timeout=30)
-    return json.loads(r.text)
+    try:
+        url = GITHUB_RAW + filename
+        r = requests.get(url, timeout=30)
+        r.raise_for_status()
+        return json.loads(r.text)
+    except Exception as e:
+        st.error(f"Failed to load {filename}: {e}")
+        return []
 
-with st.spinner("Loading scan data..."):
-    STOCK_DATA   = load_json("data_stocks.json")
-    REBOUND_DATA = load_json("data_rebound.json")
-    MY_WATCHLIST = load_json("data_watchlist.json")
+STOCK_DATA   = load_json("data_stocks.json")
+REBOUND_DATA = load_json("data_rebound.json")
+MY_WATCHLIST = load_json("data_watchlist.json")
+
+if not STOCK_DATA:
+    st.error("⚠ Could not load data files. Check your GitHub username in app.py line 11.")
+    st.stop()
 
 # ─── PAGE CONFIG ─────────────────────────────────────────────────────────────
 st.set_page_config(page_title="ZigZag Terminal", page_icon="📡",
