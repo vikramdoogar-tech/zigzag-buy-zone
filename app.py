@@ -87,7 +87,7 @@ st.caption(f"{len(STOCK_DATA)} scanner · {len(REBOUND_DATA)} rebound · Scan: 4
 tab1, tab2, tab3 = st.tabs(["📡  Buy Zone Scanner", "📈  Rebound Scanner", "🔬  My Research"])
 
 # ─── PRICE FETCHER ────────────────────────────────────────────────────────────
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=300, show_spinner=False)
 def get_prices(syms):
     out = {}
     for i in range(0, len(syms), 50):
@@ -111,6 +111,13 @@ def get_prices(syms):
 # TAB 1 — BUY ZONE SCANNER (live prices)
 # ══════════════════════════════════════════════════════════════════════════════
 with tab1:
+    col_ref, col_time = st.columns([1,3])
+    with col_ref:
+        if st.button("🔄 Refresh prices", key="refresh_btn"):
+            st.cache_data.clear()
+            st.rerun()
+    with col_time:
+        st.caption(f"Prices auto-refresh every 5 min · Last: {datetime.now().strftime('%H:%M:%S')} IST")
     pool = [s for s in STOCK_DATA
             if s["score"] >= min_score and s["rr"] >= min_rr
             and s["tier"] in tiers
@@ -119,7 +126,7 @@ with tab1:
 
     live = get_prices(tuple(s["sym"] for s in pool))
 
-    st.caption(f"✓ {len(live)}/{len(pool)} prices loaded — {datetime.now().strftime('%H:%M:%S')} IST")
+    st.caption(f"✓ {len(live)}/{len(pool)} live NSE prices · {datetime.now().strftime('%H:%M:%S')} IST · auto-refreshes every 5 min")
 
     rows = []
     for s in pool:
@@ -262,7 +269,7 @@ with tab2:
             <div class="pcol"><div class="plbl">UPSIDE</div><div class="pval" style="color:#22c55e">+{r["up_scan"]}%</div></div>
             <div class="pcol"><div class="plbl">⏱ RISE DAYS</div><div class="pval" style="color:#fbbf24">~{int(r.get("rdays",0))}d</div></div>
             <div class="pcol"><div class="plbl">DROP DAYS</div><div class="pval" style="color:#94a3b8">~{int(r.get("ddays",0))}d</div></div>
-            <div class="pcol"><div class="plbl">⏳ DAYS TO TGT</div><div class="pval" style="color:#2dd4bf">{"~"+str(round(max(0,(r["target"]/r["price"]-1)*100/r["speed"]),1))+"d" if r.get("speed",0)>0 and r["target"]>r["price"] else "—"}</div></div>
+            <div class="pcol"><div class="plbl">⏳ MAX DAYS LEFT*</div><div class="pval" style="color:#2dd4bf">{"~"+str(round(max(0,(r["target"]/r["price"]-1)*100/r["speed"]),1))+"d" if r.get("speed",0)>0 and r["target"]>r["price"] else "—"}</div></div>
           </div></div>""", unsafe_allow_html=True)
 
     MAX=40
@@ -277,7 +284,7 @@ with tab2:
         st.markdown(f"### 🔵 Below Zone ({len(below2)})")
         for r in below2[:MAX]: rb_card(r)
     st.divider()
-    st.caption("⚠ Prices are scan-date (4 Mar 2026). Use Tab 1 for live prices on 506 key stocks.")
+    st.caption("⚠ Scan prices from 4 Mar 2026 — levels (L1/L2/L3/SL/Target) are still valid. *MAX DAYS LEFT is upper bound from scan price, actual may be less if stock has risen. Use Tab 1 for live prices on 506 key stocks.")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 3 — MY RESEARCH (5 portfolios)
