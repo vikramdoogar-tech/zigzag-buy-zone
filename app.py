@@ -111,13 +111,7 @@ def get_prices(syms):
 # TAB 1 — BUY ZONE SCANNER (live prices)
 # ══════════════════════════════════════════════════════════════════════════════
 with tab1:
-    col_ref, col_time = st.columns([1,3])
-    with col_ref:
-        if st.button("🔄 Refresh prices", key="refresh_btn"):
-            st.cache_data.clear()
-            st.rerun()
-    with col_time:
-        st.caption(f"Prices auto-refresh every 5 min · Last: {datetime.now().strftime('%H:%M:%S')} IST")
+    st.caption(f"🔄 Prices auto-refresh every 5 min · Last loaded: {datetime.now().strftime('%H:%M:%S')} IST")
     pool = [s for s in STOCK_DATA
             if s["score"] >= min_score and s["rr"] >= min_rr
             and s["tier"] in tiers
@@ -201,7 +195,7 @@ with tab1:
 # ══════════════════════════════════════════════════════════════════════════════
 with tab2:
     st.markdown("### 📈 Full Market Rebound Scanner")
-    st.caption(f"{len(REBOUND_DATA)} stocks · All NSE indexes · Scan prices 4 Mar 2026")
+    st.caption(f"674 stocks · Named indexes + Broader NSE (above 200DMA & ₹20+) · Scan 4 Mar 2026")
 
     col_a, col_b = st.columns(2)
     with col_a:
@@ -221,12 +215,11 @@ with tab2:
         ["Fastest rebound","Closest to zone","Best upside %","Highest score","Most rotations/yr"],
         horizontal=True, key="s2")
 
-    rb = [r for r in REBOUND_DATA
+    rb = [{**r, "up_scan": round((r["target"]/r["price"]-1)*100,1) if r["price"]>0 else 0}
+          for r in REBOUND_DATA
           if (not above_200_rb or r["above"])
-          and (idx_f=="All Indexes" or idx_f in r["tags"])]
-
-    for r in rb:
-        r["up_scan"] = round((r["target"]/r["price"]-1)*100,1) if r["price"]>0 else 0
+          and (idx_f=="All Indexes" or idx_f in r["tags"])
+          and (r["tags"] != "Broader NSE" or (r["above"] and r["price"] >= 20))]
 
     in_z2 =[r for r in rb if -3  <=r["dist"]<=3]
     near2 =[r for r in rb if  3  < r["dist"]<=prox2]
