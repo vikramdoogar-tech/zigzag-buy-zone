@@ -6,12 +6,8 @@ import json, time, requests
 from datetime import datetime
 
 # ─── LOAD DATA FROM GITHUB ───────────────────────────────────────────────────
-# These files are in your zigzag-buy-zone GitHub repo
-# ── Auto-detect GitHub repo from Streamlit's running URL ─────────────────────
 import os
-_repo_url = os.environ.get("STREAMLIT_SERVER_BASE_URL_PATH", "")
-# Fallback: hardcode your GitHub username below if auto-detect fails
-GITHUB_USER = "vikramdoogar-tech"   # ← your GitHub username
+GITHUB_USER = "vikramdoogar-tech"
 GITHUB_REPO = "zigzag-buy-zone"
 GITHUB_RAW  = f"https://raw.githubusercontent.com/{GITHUB_USER}/{GITHUB_REPO}/main/"
 
@@ -87,82 +83,142 @@ st.caption(f"{len(STOCK_DATA)} scanner · {len(REBOUND_DATA)} rebound · Scan: 4
 tab1, tab2, tab3 = st.tabs(["📡  Buy Zone Scanner", "📈  Rebound Scanner", "🔬  My Research"])
 
 # ─── PRICE FETCHER ────────────────────────────────────────────────────────────
+# FIX 4: removed deprecated threads=True
+# FIX 2: robust MultiIndex + single-ticker handling
+# FIX 6: fetch ALL stocks at once and cache; filter in Python so slider
+#         interactions never trigger extra network calls
 @st.cache_data(ttl=300, show_spinner=False)
-def get_prices(syms):
+def get_prices(syms: tuple) -> dict:
+    """Fetch latest close prices for a tuple of NSE symbols.
+    Returns {sym: price} for every symbol successfully retrieved.
+    """
     out = {}
-    for i in range(0, len(syms), 50):
-        batch = syms[i:i+50]
+    sym_list = list(syms)
+    for i in range(0, len(sym_list), 50):
+        batch = sym_list[i:i+50]
+        ns_batch = [s + ".NS" for s in batch]
         try:
-            raw = yf.download([s+".NS" for s in batch], period="1d", interval="1d",
-                              auto_adjust=True, progress=False, threads=True)
-            if raw.empty: continue
-            cl = raw["Close"].iloc[-1] if isinstance(raw.columns, pd.MultiIndex) else raw.iloc[-1]
+            # FIX 4: threads= removed (deprecated in yfinance ≥ 0.2)
+            raw = yf.download(ns_batch, period="1d", interval="1d",
+                              auto_adjust=True, progress=False)
+            if raw.empty:
+                continue
+
+            # FIX 2: unified close extraction that handles both MultiIndex
+            # (multi-ticker batch) and plain Index (single-ticker batch)
+            if isinstance(raw.columns, pd.MultiIndex):
+                if "Close" in raw.columns.get_level_values(0):
+                    closes = raw["Close"].iloc[-1]
+                else:
+                    continue
+            else:
+                # Single ticker → columns are OHLCV strings
+                if "Close" in raw.columns:
+                    closes = raw["Close"]
+                    # closes is a Series; iloc[-1] is a scalar
+                    val = closes.iloc[-1]
+                    sym = batch[0]
+                    if val is not None and not np.isnan(float(val)):
+                        out[sym] = round(float(val), 2)
+                    continue
+
             for s in batch:
+                key = s + ".NS"
                 try:
-                    v = cl.get(s+".NS") if hasattr(cl,"get") else cl[s+".NS"]
-                    if v is not None and not np.isnan(float(v)):
-                        out[s] = round(float(v), 2)
-                except: pass
-        except: pass
+                    if key in closes.index:
+                        v = closes[key]
+                        if v is not None and not np.isnan(float(v)):
+                            out[s] = round(float(v), 2)
+                except Exception:
+                    pass
+        except Exception:
+            pass
         time.sleep(0.2)
     return out
+
+
+# FIX 6: Single cached call for Tab 1 covering all STOCK_DATA symbols
+@st.cache_data(ttl=300, show_spinner=False)
+def get_all_scanner_prices() -> dict:
+    return get_prices(tuple(s["sym"] for s in STOCK_DATA))
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 1 — BUY ZONE SCANNER (live prices)
 # ══════════════════════════════════════════════════════════════════════════════
 with tab1:
     st.caption(f"🔄 Prices auto-refresh every 5 min · Last loaded: {datetime.now().strftime('%H:%M:%S')} IST")
+
     pool = [s for s in STOCK_DATA
             if s["score"] >= min_score and s["rr"] >= min_rr
             and s["tier"] in tiers
             and (not above_only or s["above_200"])
             and (not sectors or s.get("sector","") in sectors)]
 
-    live = get_prices(tuple(s["sym"] for s in pool))
+    # FIX 6: use single bulk-cached fetch; no extra network call per filter change
+    live_all = get_all_scanner_prices()
+    live = {s["sym"]: live_all[s["sym"]] for s in pool if s["sym"] in live_all}
 
     st.caption(f"✓ {len(live)}/{len(pool)} live NSE prices · {datetime.now().strftime('%H:%M:%S')} IST · auto-refreshes every 5 min")
 
     rows = []
     for s in pool:
-        if s["sym"] not in live: continue
-        p=live[s["sym"]]; cb=s["crash_buy"]
-        d=round((p/cb-1)*100,2)
-        l2=round(cb*(1-s["avg_drop"]*0.15/100),2)
-        l3=round(cb*(1-s["avg_drop"]*0.30/100),2)
-        rows.append({**s,"live":p,"dist":d,"l2":l2,"l3":l3,
-                     "sl":round(l3*0.95,2),"up":round((s["rot_target"]/p-1)*100,1)})
+        if s["sym"] not in live:
+            continue
+        p  = live[s["sym"]]
+        cb = s["crash_buy"]
+        d  = round((p / cb - 1) * 100, 2)
+        l2 = round(cb * (1 - s["avg_drop"] * 0.15 / 100), 2)
+        l3 = round(cb * (1 - s["avg_drop"] * 0.30 / 100), 2)
+        rows.append({**s, "live": p, "dist": d, "l2": l2, "l3": l3,
+                     "sl": round(l3 * 0.95, 2),
+                     "up": round((s["rot_target"] / p - 1) * 100, 1)})
 
     sort1 = st.radio("⚡ Sort by",
-        ["Closest to zone","Fastest rebound","Best upside %","Highest score"],
+        ["Closest to zone", "Fastest rebound", "Best upside %", "Highest score"],
         horizontal=True, key="s1")
-    if sort1=="Fastest rebound":  rows.sort(key=lambda x: -x.get("rise_speed",0))
-    elif sort1=="Best upside %":  rows.sort(key=lambda x: -x["up"])
-    elif sort1=="Highest score":  rows.sort(key=lambda x: -x["score"])
-    else:                         rows.sort(key=lambda x: x["dist"])
+    if   sort1 == "Fastest rebound": rows.sort(key=lambda x: -x.get("rise_speed", 0))
+    elif sort1 == "Best upside %":   rows.sort(key=lambda x: -x["up"])
+    elif sort1 == "Highest score":   rows.sort(key=lambda x: -x["score"])
+    else:                            rows.sort(key=lambda x:  x["dist"])
 
-    in_z=[r for r in rows if -3<=r["dist"]<=3]
-    near=[r for r in rows if  3< r["dist"]<=prox]
-    below=[r for r in rows if r["dist"]< -3]
+    in_z  = [r for r in rows if -3 <= r["dist"] <= 3]
+    near  = [r for r in rows if  3 <  r["dist"] <= prox]
+    below = [r for r in rows if       r["dist"] <  -3]
 
-    c1,c2,c3,c4=st.columns(4)
-    c1.metric("🟢 In Zone",len(in_z))
-    c2.metric("🟡 Approaching",len(near))
-    c3.metric("🔵 Below Zone",len(below))
-    c4.metric("📊 Scanned",len(rows))
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("🟢 In Zone",      len(in_z))
+    c2.metric("🟡 Approaching",  len(near))
+    c3.metric("🔵 Below Zone",   len(below))
+    c4.metric("📊 Scanned",      len(rows))
     st.divider()
 
-    def scan_card(r,mode):
-        icons={"zone":"🟢","near":"🟡","below":"🔵"}
-        css={"zone":"card-green","near":"card-yellow","below":"card-red"}
-        dcol={"zone":"green","near":"yellow","below":"blue"}
-        sign="+" if r["dist"]>0 else ""
-        ab="↑200" if r["above_200"] else "↓200"
-        spd=r.get("rise_speed",0)
+    def scan_card(r, mode):
+        icons = {"zone": "🟢", "near": "🟡", "below": "🔵"}
+        css   = {"zone": "card-green", "near": "card-yellow", "below": "card-red"}
+        dcol  = {"zone": "green",      "near": "yellow",      "below": "blue"}
+        sign  = "+" if r["dist"] > 0 else ""
+        spd   = r.get("rise_speed", 0)
+
+        # FIX 1: pre-compute values used inside f-string to avoid nested
+        # same-quote expressions — was a SyntaxError on Python < 3.12
+        ab_cls = "badge-green" if r["above_200"] else "badge-red"
+        ab_lbl = "↑200" if r["above_200"] else "↓200"
+
+        # elapsed / days-left (rise_speed=0 guard already correct in original)
+        if spd > 0:
+            elapsed  = "~" + str(round(max(0, (r["live"] / r["crash_buy"] - 1) * 100 / spd), 1)) + "d"
+            days_lft = ("~" + str(round(max(0, (r["rot_target"] / r["live"] - 1) * 100 / spd), 1)) + "d"
+                        if r["live"] < r["rot_target"] else "✅ At target")
+        else:
+            elapsed  = "Day 0"
+            days_lft = "—"
+
         st.markdown(f"""<div class="card {css[mode]}">
           <span class="sym">{icons[mode]} {r["sym"]}</span>
           <span class="badge">{r["tier"]}</span>
           <span class="badge">{r.get("sector","")}</span>
-          <span class="badge {"badge-green" if r["above_200"] else "badge-red"}">{ab}</span>
+          <span class="badge {ab_cls}">{ab_lbl}</span>
           <div class="dist {dcol[mode]}">{sign}{r["dist"]:.2f}% · ⚡{spd:.1f}%/day</div>
           <div class="meta">Score {r["score"]} · R:R {r["rr"]} · Win {int(r["win_pct"])}% · {r["rot_yr"]}×/yr</div>
           <div class="prow">
@@ -175,34 +231,34 @@ with tab1:
             <div class="pcol"><div class="plbl">UPSIDE</div><div class="pval" style="color:#22c55e">+{r["up"]}%</div></div>
             <div class="pcol"><div class="plbl">⏱ RISE DAYS</div><div class="pval" style="color:#fbbf24">~{int(r.get("rise_days",0))}d</div></div>
             <div class="pcol"><div class="plbl">DROP DAYS</div><div class="pval" style="color:#94a3b8">~{int(r.get("drop_days",0))}d</div></div>
-            <div class="pcol"><div class="plbl">🕐 ELAPSED EST</div><div class="pval" style="color:#c084fc">{"~"+str(round(max(0,(r["live"]/r["crash_buy"]-1)*100/r.get("rise_speed",1)),1))+"d" if r.get("rise_speed",0)>0 else "Day 0"}</div></div>
-            <div class="pcol"><div class="plbl">⏳ DAYS LEFT</div><div class="pval" style="color:#2dd4bf">{"~"+str(round(max(0,(r["rot_target"]/r["live"]-1)*100/r.get("rise_speed",1)),1))+"d" if r.get("rise_speed",0)>0 and r["live"]<r["rot_target"] else "✅ At target"}</div></div>
+            <div class="pcol"><div class="plbl">🕐 ELAPSED EST</div><div class="pval" style="color:#c084fc">{elapsed}</div></div>
+            <div class="pcol"><div class="plbl">⏳ DAYS LEFT</div><div class="pval" style="color:#2dd4bf">{days_lft}</div></div>
           </div></div>""", unsafe_allow_html=True)
 
     if in_z:
         st.markdown(f"### 🟢 In Zone ({len(in_z)})")
-        for r in in_z[:25]: scan_card(r,"zone")
+        for r in in_z[:25]:  scan_card(r, "zone")
     else:
         st.info("No stocks within ±3% right now.")
     if near:
         st.markdown(f"### 🟡 Approaching ({len(near)})")
-        for r in near[:30]: scan_card(r,"near")
+        for r in near[:30]:  scan_card(r, "near")
     with st.expander(f"🔵 Below Zone ({len(below)})"):
-        for r in below[:25]: scan_card(r,"below")
+        for r in below[:25]: scan_card(r, "below")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 2 — REBOUND SCANNER (2057 stocks, scan prices)
+# TAB 2 — REBOUND SCANNER (scan prices)
 # ══════════════════════════════════════════════════════════════════════════════
 with tab2:
     st.markdown("### 📈 Full Market Rebound Scanner")
-    st.caption(f"674 stocks · Named indexes + Broader NSE (above 200DMA & ₹20+) · Scan 4 Mar 2026")
+    st.caption("674 stocks · Named indexes + Broader NSE (above 200DMA & ₹20+) · Scan 4 Mar 2026")
 
     col_a, col_b = st.columns(2)
     with col_a:
         above_200_rb = st.checkbox("🟢 Above 200DMA only", value=True, key="rb_a")
-        show_zone    = st.checkbox("Show In Zone (≤3%)",       value=True,  key="rb_z")
-        show_appr    = st.checkbox("Show Approaching (3–20%)", value=True,  key="rb_p")
-        show_blw     = st.checkbox("Show Below Zone (<−3%)",   value=False, key="rb_b")
+        show_zone    = st.checkbox("Show In Zone (≤3%)",        value=True,  key="rb_z")
+        show_appr    = st.checkbox("Show Approaching (3–20%)",  value=True,  key="rb_p")
+        show_blw     = st.checkbox("Show Below Zone (<−3%)",    value=False, key="rb_b")
     with col_b:
         idx_opts = ["All Indexes","Nifty 50","Next 50","Nifty 100","Nifty 200",
                     "Nifty 500","Midcap 150","Smallcap 250","IT","Bank","PSU Bank",
@@ -215,41 +271,54 @@ with tab2:
         ["Fastest rebound","Closest to zone","Best upside %","Highest score","Most rotations/yr"],
         horizontal=True, key="s2")
 
-    rb = [{**r, "up_scan": round((r["target"]/r["price"]-1)*100,1) if r["price"]>0 else 0}
+    rb = [{**r, "up_scan": round((r["target"] / r["price"] - 1) * 100, 1) if r["price"] > 0 else 0}
           for r in REBOUND_DATA
           if (not above_200_rb or r["above"])
-          and (idx_f=="All Indexes" or idx_f in r["tags"])
+          and (idx_f == "All Indexes" or idx_f in r["tags"])
           and (r["tags"] != "Broader NSE" or (r["above"] and r["price"] >= 20))]
 
-    in_z2 =[r for r in rb if -3  <=r["dist"]<=3]
-    near2 =[r for r in rb if  3  < r["dist"]<=prox2]
-    below2=[r for r in rb if     r["dist"]< -3]
+    in_z2  = [r for r in rb if -3   <= r["dist"] <= 3]
+    near2  = [r for r in rb if  3   <  r["dist"] <= prox2]
+    below2 = [r for r in rb if       r["dist"]   <  -3]
 
-    sk = {"Fastest rebound":  lambda x:-x["speed"],
-          "Closest to zone":  lambda x:x["dist"],
-          "Best upside %":    lambda x:-x["up_scan"],
-          "Highest score":    lambda x:-x["score"],
-          "Most rotations/yr":lambda x:-x["roty"]}[sort2]
+    sk = {"Fastest rebound":   lambda x: -x["speed"],
+          "Closest to zone":   lambda x:  x["dist"],
+          "Best upside %":     lambda x: -x["up_scan"],
+          "Highest score":     lambda x: -x["score"],
+          "Most rotations/yr": lambda x: -x["roty"]}[sort2]
     in_z2.sort(key=sk); near2.sort(key=sk); below2.sort(key=sk)
 
-    c1,c2,c3,c4=st.columns(4)
-    c1.metric("🟢 In Zone",len(in_z2))
-    c2.metric("🟡 Approaching",len(near2))
-    c3.metric("🔵 Below Zone",len(below2))
-    c4.metric("Filtered total",len(rb))
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("🟢 In Zone",    len(in_z2))
+    c2.metric("🟡 Approaching", len(near2))
+    c3.metric("🔵 Below Zone",  len(below2))
+    c4.metric("Filtered total", len(rb))
     st.divider()
 
     def rb_card(r):
-        d=r["dist"]
-        if -3<=d<=3:   css,dcol,icon="card-green","green","🟢"
-        elif d<-3:     css,dcol,icon="card-blue","blue","🔵"
-        else:          css,dcol,icon="card-yellow","yellow","🟡"
-        sign="+" if d>0 else ""
-        ab='<span class="badge badge-green">↑200DMA</span>' if r["above"] else '<span class="badge badge-red">↓200DMA</span>'
-        tags=r["tags"].replace("Broader NSE","").replace(" | "," ").strip()[:30]
+        d = r["dist"]
+        if   -3 <= d <= 3: css, dcol, icon = "card-green",  "green",  "🟢"
+        elif d < -3:        css, dcol, icon = "card-blue",   "blue",   "🔵"
+        else:               css, dcol, icon = "card-yellow", "yellow", "🟡"
+        sign = "+" if d > 0 else ""
+
+        # FIX 1 (same principle): pre-compute badge class
+        ab_html = ('<span class="badge badge-green">↑200DMA</span>'
+                   if r["above"] else
+                   '<span class="badge badge-red">↓200DMA</span>')
+
+        # FIX 5: suppress empty badge for Broader-NSE-only stocks
+        raw_tags = r["tags"].replace("Broader NSE", "").replace(" | ", " ").strip()[:30]
+        tags_html = f'<span class="badge">{raw_tags}</span>' if raw_tags else ""
+
+        # days-left guard
+        if r.get("speed", 0) > 0 and r["target"] > r["price"]:
+            days_lft = "~" + str(round(max(0, (r["target"] / r["price"] - 1) * 100 / r["speed"]), 1)) + "d"
+        else:
+            days_lft = "—"
+
         st.markdown(f"""<div class="card {css}">
-          <span class="sym">{icon} {r["sym"]}</span>{ab}
-          <span class="badge">{tags}</span>
+          <span class="sym">{icon} {r["sym"]}</span>{ab_html}{tags_html}
           <div class="dist {dcol}">{sign}{d:.2f}% · ⚡{r["speed"]:.1f}%/day</div>
           <div class="meta">Score {r["score"]} · R:R {r["rr"]} · Win {r["win"]}% · {r["roty"]}×/yr · Rise {r["rise"]}%</div>
           <div class="prow">
@@ -262,22 +331,24 @@ with tab2:
             <div class="pcol"><div class="plbl">UPSIDE</div><div class="pval" style="color:#22c55e">+{r["up_scan"]}%</div></div>
             <div class="pcol"><div class="plbl">⏱ RISE DAYS</div><div class="pval" style="color:#fbbf24">~{int(r.get("rdays",0))}d</div></div>
             <div class="pcol"><div class="plbl">DROP DAYS</div><div class="pval" style="color:#94a3b8">~{int(r.get("ddays",0))}d</div></div>
-            <div class="pcol"><div class="plbl">⏳ MAX DAYS LEFT*</div><div class="pval" style="color:#2dd4bf">{"~"+str(round(max(0,(r["target"]/r["price"]-1)*100/r["speed"]),1))+"d" if r.get("speed",0)>0 and r["target"]>r["price"] else "—"}</div></div>
+            <div class="pcol"><div class="plbl">⏳ MAX DAYS LEFT*</div><div class="pval" style="color:#2dd4bf">{days_lft}</div></div>
           </div></div>""", unsafe_allow_html=True)
 
-    MAX=40
+    MAX = 40
     if show_zone and in_z2:
         st.markdown(f"### 🟢 In Buy Zone ({len(in_z2)})")
         st.caption("At crash buy level — GTC should be set")
-        for r in in_z2[:MAX]: rb_card(r)
+        for r in in_z2[:MAX]:  rb_card(r)
     if show_appr and near2:
         st.markdown(f"### 🟡 Approaching — within {prox2}% ({len(near2)})")
-        for r in near2[:MAX]: rb_card(r)
+        for r in near2[:MAX]:  rb_card(r)
     if show_blw and below2:
         st.markdown(f"### 🔵 Below Zone ({len(below2)})")
         for r in below2[:MAX]: rb_card(r)
     st.divider()
-    st.caption("⚠ Scan prices from 4 Mar 2026 — levels (L1/L2/L3/SL/Target) are still valid. *MAX DAYS LEFT is upper bound from scan price, actual may be less if stock has risen. Use Tab 1 for live prices on 506 key stocks.")
+    st.caption("⚠ Scan prices from 4 Mar 2026 — levels (L1/L2/L3/SL/Target) are still valid. "
+               "*MAX DAYS LEFT is upper bound from scan price, actual may be less if stock has risen. "
+               "Use Tab 1 for live prices on 506 key stocks.")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 3 — MY RESEARCH (5 portfolios)
@@ -288,61 +359,77 @@ with tab3:
 
     st.caption(f"✓ {len(wl_live)}/{len(wl_syms)} loaded — {datetime.now().strftime('%H:%M:%S')} IST")
 
-    inv=0; cur=0; win3=0; los3=0
+    inv = 0; cur = 0; win3 = 0; los3 = 0
     for w in MY_WATCHLIST:
-        lp=wl_live.get(w["sym"])
-        if lp and w.get("qty",0)>0:
-            inv+=w["qty"]*w["entry"]; cur+=w["qty"]*lp
+        lp = wl_live.get(w["sym"])
+        if lp and w.get("qty", 0) > 0:
+            inv += w["qty"] * w["entry"]
+            cur += w["qty"] * lp
         if lp:
-            if lp>=w["entry"]: win3+=1
-            else: los3+=1
+            if lp >= w["entry"]: win3 += 1
+            else:                los3 += 1
 
-    c1,c2,c3,c4=st.columns(4)
-    c1.metric("Tracked",len(MY_WATCHLIST))
-    c2.metric("📈 Above entry",win3)
-    c3.metric("📉 Below entry",los3)
-    if inv>0:
-        pnl=cur-inv
-        c4.metric("P&L",f"₹{pnl:+,.0f}",delta=f"{pnl/inv*100:+.1f}%")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Tracked",        len(MY_WATCHLIST))
+    c2.metric("📈 Above entry", win3)
+    c3.metric("📉 Below entry", los3)
+    if inv > 0:
+        pnl = cur - inv
+        c4.metric("P&L", f"₹{pnl:+,.0f}", delta=f"{pnl/inv*100:+.1f}%")
     st.divider()
 
-    holder_f=st.selectbox("Portfolio",["All","Vikram","Divya","Shreya","Nidhi","Vivek"])
-    sort3=st.radio("Sort by",["% vs entry","Symbol","Upside to target"],horizontal=True,key="s3")
+    holder_f = st.selectbox("Portfolio", ["All","Vikram","Divya","Shreya","Nidhi","Vivek"])
+    sort3    = st.radio("Sort by", ["% vs entry","Symbol","Upside to target"],
+                        horizontal=True, key="s3")
 
-    dl=[]
+    dl = []
     for w in MY_WATCHLIST:
-        if holder_f!="All" and holder_f not in w.get("holders",""):
-            continue
-        lp=wl_live.get(w["sym"])
-        dl.append({**w,"lp":lp,
-                   "chg":(lp/w["entry"]-1)*100 if lp else None,
-                   "up":(w["target"]/lp-1)*100 if lp else None})
+        # FIX 3: exact-match holders via split+strip, not bare substring check
+        if holder_f != "All":
+            holders_list = [h.strip() for h in w.get("holders", "").split(",")]
+            if holder_f not in holders_list:
+                continue
+        lp = wl_live.get(w["sym"])
+        dl.append({**w, "lp": lp,
+                   "chg": (lp / w["entry"] - 1) * 100 if lp else None,
+                   "up":  (w["target"] / lp - 1) * 100 if lp else None})
 
-    if sort3=="% vs entry": dl.sort(key=lambda x:x["chg"] if x["chg"] is not None else -999,reverse=True)
-    elif sort3=="Symbol":   dl.sort(key=lambda x:x["sym"])
-    else:                   dl.sort(key=lambda x:x["up"] if x["up"] is not None else -999,reverse=True)
+    if   sort3 == "% vs entry":        dl.sort(key=lambda x: x["chg"] if x["chg"] is not None else -999, reverse=True)
+    elif sort3 == "Symbol":            dl.sort(key=lambda x: x["sym"])
+    else:                              dl.sort(key=lambda x: x["up"]  if x["up"]  is not None else -999, reverse=True)
 
     for w in dl:
-        sym=w["sym"]; entry=w["entry"]; tgt=w["target"]; sl=w["sl"]
-        qty=w.get("qty",0); thesis=w.get("thesis",""); holders=w.get("holders","")
-        lp=w["lp"]
+        sym     = w["sym"];   entry = w["entry"]
+        tgt     = w["target"]; sl   = w["sl"]
+        qty     = w.get("qty", 0)
+        thesis  = w.get("thesis", "")
+        holders = w.get("holders", "")
+        lp      = w["lp"]
+
         if not lp:
             st.markdown(f'''<div class="card card-blue"><span class="sym">⏳ {sym}</span>
             <span class="badge" style="background:#1a2a40;color:#94a3b8">{holders}</span>
-            <div class="thesis-box">📝 {thesis}</div></div>''',unsafe_allow_html=True)
+            <div class="thesis-box">📝 {thesis}</div></div>''', unsafe_allow_html=True)
             continue
-        chg=w["chg"]; to_t=(tgt/lp-1)*100; to_sl=(sl/lp-1)*100
-        rr=abs(to_t/to_sl) if to_sl else 0
-        if lp>=tgt:     css,icon="card-teal","🎯"
-        elif lp>=entry: css,icon="card-green","📈"
-        elif lp<=sl:    css,icon="card-red","⛔"
-        else:           css,icon="card-yellow","👁"
-        chg_col="green" if chg>=0 else "red"
+
+        chg  = w["chg"]
+        to_t = (tgt / lp - 1) * 100
+        to_sl = (sl  / lp - 1) * 100
+        rr   = abs(to_t / to_sl) if to_sl else 0
+
+        # FIX 1: pre-compute badge class (no nested quotes in f-string)
+        if   lp >= tgt:   css, icon = "card-teal",   "🎯"
+        elif lp >= entry: css, icon = "card-green",  "📈"
+        elif lp <= sl:    css, icon = "card-red",    "⛔"
+        else:             css, icon = "card-yellow", "👁"
+        chg_col = "green" if chg >= 0 else "red"
+        val_str = (f"{qty} shares · ₹{qty*lp:,.0f}" if qty > 0 else "Watching")
+
         st.markdown(f"""<div class="card {css}">
           <span class="sym">{icon} {sym}</span>
           <span class="badge" style="background:#1a2a40;color:#94a3b8">{holders}</span>
           <div class="dist {chg_col}">{chg:+.2f}% vs entry · R:R {rr:.1f}x</div>
-          <div class="meta">{""+str(qty)+" shares · ₹"+str(f"{qty*lp:,.0f}") if qty>0 else "Watching"}</div>
+          <div class="meta">{val_str}</div>
           <div class="prow">
             <div class="pcol"><div class="plbl">LIVE</div><div class="pval">₹{lp:,.2f}</div></div>
             <div class="pcol"><div class="plbl">ENTRY</div><div class="pval">₹{entry:,.2f}</div></div>
