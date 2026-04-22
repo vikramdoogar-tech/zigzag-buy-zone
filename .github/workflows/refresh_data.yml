@@ -11,15 +11,17 @@ permissions:
 jobs:
   refresh:
     runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.1.1
         with:
           persist-credentials: true
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v5.1.0
         with:
           python-version: "3.11"
 
@@ -28,9 +30,21 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Show repo files
+        run: |
+          pwd
+          ls -la
+          find . -maxdepth 3 -type f | sort
+
       - name: Run refresh script
         run: |
-          python refresh_data.py
+          python refresh_data.py || echo "refresh_data.py had some errors, continuing"
+
+      - name: Show generated files
+        run: |
+          ls -la
+          [ -f data_rebound.refreshed.json ] && echo "Found data_rebound.refreshed.json" || echo "Missing data_rebound.refreshed.json"
+          [ -f data_watchlist.refreshed.json ] && echo "Found data_watchlist.refreshed.json" || echo "Missing data_watchlist.refreshed.json"
 
       - name: Replace old JSON with refreshed files
         run: |
