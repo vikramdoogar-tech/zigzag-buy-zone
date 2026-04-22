@@ -3,7 +3,7 @@ name: Refresh ZigZag Data
 on:
   workflow_dispatch:
   schedule:
-    - cron: "20 11 * * 1-5"   # 16:50 IST, Mon-Fri
+    - cron: "20 11 * * 1-5"   # 16:50 IST
 
 permissions:
   contents: write
@@ -11,17 +11,17 @@ permissions:
 jobs:
   refresh:
     runs-on: ubuntu-latest
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v4.1.1
-        with:
-          persist-credentials: true
+        uses: actions/checkout@v4
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
       - name: Set up Python
-        uses: actions/setup-python@v5.1.0
+        uses: actions/setup-python@v5
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
         with:
           python-version: "3.11"
 
@@ -30,32 +30,20 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Show repo files
-        run: |
-          pwd
-          ls -la
-          find . -maxdepth 3 -type f | sort
-
       - name: Run refresh script
         run: |
-          python refresh_data.py || echo "refresh_data.py had some errors, continuing"
+          python refresh_data.py || echo "Script had minor errors"
 
-      - name: Show generated files
-        run: |
-          ls -la
-          [ -f data_rebound.refreshed.json ] && echo "Found data_rebound.refreshed.json" || echo "Missing data_rebound.refreshed.json"
-          [ -f data_watchlist.refreshed.json ] && echo "Found data_watchlist.refreshed.json" || echo "Missing data_watchlist.refreshed.json"
-
-      - name: Replace old JSON with refreshed files
+      - name: Replace JSON
         run: |
           if [ -f data_rebound.refreshed.json ]; then cp data_rebound.refreshed.json data_rebound.json; fi
           if [ -f data_watchlist.refreshed.json ]; then cp data_watchlist.refreshed.json data_watchlist.json; fi
 
-      - name: Commit and push if changed
+      - name: Commit changes
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data_rebound.json data_watchlist.json data_rebound.refreshed.json data_watchlist.refreshed.json || true
-          git diff --cached --quiet && echo "No changes to commit" && exit 0
-          git commit -m "Auto-refresh ZigZag data"
+          git add .
+          git diff --cached --quiet && exit 0
+          git commit -m "Auto refresh data"
           git push
