@@ -1,3 +1,4 @@
-streamlit>=1.36
-yfinance>=0.2.54
-requests>=2.31
+streamlit
+yfinance
+pandas
+requests
