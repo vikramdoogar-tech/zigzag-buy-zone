@@ -1,148 +1,714 @@
-name: 📈 Daily Stock Update
+"""
+update_stocks.py
+================
+Automated Stock Analysis Engine for NSE/BSE
+Fetches prices, computes ZigZag cycles, updates buy zones and targets.
 
-on:
-  schedule:
-    # Runs at 16:30 UTC = 22:00 IST (after NSE close at 15:30 IST)
-    - cron: '30 16 * * 1-5'   # Mon–Fri only
+Usage:
+    python update_stocks.py
+    python update_stocks.py --dry-run    # don't overwrite originals
+    python update_stocks.py --symbol RELIANCE  # single stock debug
+"""
 
-  # Allow manual trigger from GitHub UI
-  workflow_dispatch:
-    inputs:
-      dry_run:
-        description: 'Dry run (no file overwrite)?'
-        required: false
-        default: 'false'
-        type: boolean
-      symbol:
-        description: 'Single symbol to refresh (leave blank for ALL)'
-        required: false
-        default: ''
+import json
+import os
+import sys
+import time
+import logging
+import argparse
+from datetime import datetime, timedelta
+from pathlib import Path
 
-jobs:
-  update-stocks:
-    name: Refresh Stock Data
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+import numpy as np
+import pandas as pd
+import yfinance as yf
 
-    permissions:
-      contents: write   # needed to push updated JSON files back
+# ─────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────
+DATA_DIR = Path(__file__).parent / "data"
+LOG_DIR  = Path(__file__).parent / "logs"
+LOG_DIR.mkdir(exist_ok=True)
 
-    steps:
-      # ─────────────────────────────────────────
-      - name: 📥 Checkout repository
-        uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+ZIGZAG_THRESHOLD   = 0.08      # 8% swing threshold (primary)
+ZIGZAG_FALLBACKS   = [0.05, 0.03]  # retry thresholds for thin/new stocks
+HISTORY_YEARS      = 3         # years of historical data (primary)
+HISTORY_FALLBACKS  = [2, 1]    # retry lookback windows if 3yr has too few bars
+MIN_BARS           = 20        # minimum trading days needed (was 50)
+MIN_PIVOTS         = 3         # minimum ZigZag pivots needed (was 4)
+L2_DROP_FACTOR     = 0.15      # L2 = L1 - 15% of avg_drop
+L3_DROP_FACTOR     = 0.30      # L3 = L1 - 30% of avg_drop
+STOP_LOSS_BUFFER   = 0.05      # SL = L3 * 0.95
+NEAR_ZONE_PCT      = 10.0      # "near buy zone" threshold %
+REQUEST_DELAY      = 0.5       # seconds between yfinance calls
 
-      # ─────────────────────────────────────────
-      - name: 🐍 Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          cache: 'pip'
+# NSE/BSE symbol alias mapping (handles common mismatches)
+ALIAS_MAP = {
+    "BAJFINANCE":   "BAJFINANCE.NS",
+    "RELIANCE":     "RELIANCE.NS",
+    "TCS":          "TCS.NS",
+    "HDFCBANK":     "HDFCBANK.NS",
+    "INFY":         "INFY.NS",
+    "WIPRO":        "WIPRO.NS",
+    "TATAMOTORS":   "TATAMOTORS.NS",
+    "SUNPHARMA":    "SUNPHARMA.NS",
+    "AXISBANK":     "AXISBANK.NS",
+    "ICICIBANK":    "ICICIBANK.NS",
+    "MARUTI":       "MARUTI.NS",
+    "NTPC":         "NTPC.NS",
+    "HINDALCO":     "HINDALCO.NS",
+    "KOTAKBANK":    "KOTAKBANK.NS",
+    "SBIN":         "SBIN.NS",
+    "BHARTIARTL":   "BHARTIARTL.NS",
+    "ADANIENT":     "ADANIENT.NS",
+    "ADANIPORTS":   "ADANIPORTS.NS",
+    "LT":           "LT.NS",
+    "ULTRACEMCO":   "ULTRACEMCO.NS",
+    "TITAN":        "TITAN.NS",
+    "NESTLEIND":    "NESTLEIND.NS",
+    "POWERGRID":    "POWERGRID.NS",
+    "ONGC":         "ONGC.NS",
+    "COALINDIA":    "COALINDIA.NS",
+    "TECHM":        "TECHM.NS",
+    "HCLTECH":      "HCLTECH.NS",
+    "JSWSTEEL":     "JSWSTEEL.NS",
+    "TATASTEEL":    "TATASTEEL.NS",
+    "GRASIM":       "GRASIM.NS",
+    "CIPLA":        "CIPLA.NS",
+    "DRREDDY":      "DRREDDY.NS",
+    "EICHERMOT":    "EICHERMOT.NS",
+    "HEROMOTOCO":   "HEROMOTOCO.NS",
+    "BPCL":         "BPCL.NS",
+    "IOC":          "IOC.NS",
+    "M&M":          "M&M.NS",
+    "MM":           "M&M.NS",
+}
 
-      # ─────────────────────────────────────────
-      - name: 📦 Install dependencies
-        run: pip install -r requirements.txt
+# ─────────────────────────────────────────────
+# LOGGING
+# ─────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_DIR / f"update_{datetime.now().strftime('%Y%m%d')}.log"),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
+log = logging.getLogger("stock_engine")
 
-      # ─────────────────────────────────────────
-      - name: 🔄 Run stock update engine
-        run: |
-          python update_stocks.py \
-            ${{ github.event.inputs.dry_run == 'true' && '--dry-run' || '' }} \
-            ${{ github.event.inputs.symbol != '' && format('--symbol {0}', github.event.inputs.symbol) || '' }}
 
-      # ─────────────────────────────────────────
-      - name: 📤 Commit updated JSON files
-        if: github.event.inputs.dry_run != 'true'
-        run: |
-          git config user.name  "Stock Engine Bot"
-          git config user.email "stock-engine@noreply.github.com"
+# ─────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────
 
-          git add data/data_stocks_slim.json \
-                  data/data_rebound.json \
-                  data/data_watchlist.json \
-                  data/signals.json \
-                  data/data_stocks_slim.refreshed.json \
-                  data/data_rebound.refreshed.json \
-                  data/data_watchlist.refreshed.json \
-                  logs/ || true
+def resolve_ticker(symbol: str, exchange: str = "NSE") -> str:
+    """Map plain symbol to Yahoo Finance ticker."""
+    if symbol in ALIAS_MAP:
+        return ALIAS_MAP[symbol]
+    suffix = ".NS" if exchange.upper() == "NSE" else ".BO"
+    return f"{symbol}{suffix}"
 
-          git diff --staged --quiet || \
-            git commit -m "📊 Auto-update: $(date '+%Y-%m-%d %H:%M IST')"
 
-          git push
+def fetch_current_price(ticker: str) -> float | None:
+    """Fetch latest close price. Returns None on failure."""
+    try:
+        tk = yf.Ticker(ticker)
+        hist = tk.history(period="5d")
+        if hist.empty:
+            return None
+        return round(float(hist["Close"].iloc[-1]), 2)
+    except Exception as e:
+        log.warning(f"Price fetch failed for {ticker}: {e}")
+        return None
 
-      # ─────────────────────────────────────────
-      - name: 📋 Upload logs as artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: stock-engine-logs-${{ github.run_id }}
-          path: logs/
-          retention-days: 14
 
-      # ─────────────────────────────────────────
-      - name: ✅ Summary
-        run: |
-          echo "### 📈 Stock Update Complete" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- Run time: $(date '+%Y-%m-%d %H:%M UTC')" >> $GITHUB_STEP_SUMMARY
-          echo "- Dry run: ${{ github.event.inputs.dry_run || 'false' }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Symbol filter: ${{ github.event.inputs.symbol || 'ALL' }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Updated files:" >> $GITHUB_STEP_SUMMARY
-          for f in data/*.json; do echo "  - $f"; done >> $GITHUB_STEP_SUMMARYname: Refresh ZigZag Data
+def fetch_history(ticker: str, years: int = HISTORY_YEARS):
+    """
+    Fetch daily Close data. Tries primary window first, then shorter fallbacks.
+    Returns (DataFrame | None, years_actually_used).
+    Accepts as few as MIN_BARS trading days so new listings (MTAR 2021,
+    Walchandnagar thin data) are not silently dropped.
+    """
+    windows = [years] + [y for y in HISTORY_FALLBACKS if y < years]
+    end = datetime.today()
 
-on:
-  workflow_dispatch:
-  schedule:
-    - cron: "30 11 * * 1-5"   # 5:00 PM IST, Mon-Fri
+    for w in windows:
+        try:
+            start = end - timedelta(days=w * 365)
+            df = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=True)
+            if df.empty:
+                continue
+            # Handle MultiIndex columns from newer yfinance versions
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            if "Close" not in df.columns:
+                continue
+            df = df[["Close"]].copy()
+            df.columns = ["close"]
+            df.dropna(inplace=True)
+            if len(df) >= MIN_BARS:
+                if w < years:
+                    log.info(f"    ↳ Using {w}yr fallback ({len(df)} bars)")
+                return df, w
+        except Exception as e:
+            log.warning(f"History fetch failed for {ticker} ({w}yr): {e}")
 
-permissions:
-  contents: write
+    return None, 0
 
-jobs:
-  refresh:
-    runs-on: ubuntu-latest
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-        with:
-          persist-credentials: true
+# ─────────────────────────────────────────────
+# ZIGZAG ENGINE
+# ─────────────────────────────────────────────
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: pip
+def compute_zigzag(prices: pd.Series, threshold: float = ZIGZAG_THRESHOLD):
+    """
+    Identify ZigZag swing highs and lows.
+    
+    Returns:
+        list of dicts: [{idx, price, type}]  type = 'high' | 'low'
+    """
+    prices = prices.values
+    n      = len(prices)
+    if n < 5:
+        return []
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install pandas yfinance requests
+    pivots = []
+    direction = None   # 'up' | 'down'
+    last_pivot_price = prices[0]
+    last_pivot_idx   = 0
 
-      - name: Refresh stock data
-        run: |
-          python refresh_data.py
+    for i in range(1, n):
+        p = prices[i]
+        chg = (p - last_pivot_price) / last_pivot_price
 
-      - name: Replace JSON
-        run: |
-          if [ -f data_stocks_slim.refreshed.json ]; then cp data_stocks_slim.refreshed.json data_stocks_slim.json; fi
-          if [ -f data_rebound.refreshed.json ]; then cp data_rebound.refreshed.json data_rebound.json; fi
-          if [ -f data_watchlist.refreshed.json ]; then cp data_watchlist.refreshed.json data_watchlist.json; fi
+        if direction is None:
+            if chg >= threshold:
+                direction        = "up"
+                pivots.append({"idx": last_pivot_idx, "price": last_pivot_price, "type": "low"})
+                last_pivot_price = p
+                last_pivot_idx   = i
+            elif chg <= -threshold:
+                direction        = "down"
+                pivots.append({"idx": last_pivot_idx, "price": last_pivot_price, "type": "high"})
+                last_pivot_price = p
+                last_pivot_idx   = i
+        elif direction == "up":
+            if p > last_pivot_price:
+                last_pivot_price = p
+                last_pivot_idx   = i
+            elif (last_pivot_price - p) / last_pivot_price >= threshold:
+                pivots.append({"idx": last_pivot_idx, "price": last_pivot_price, "type": "high"})
+                direction        = "down"
+                last_pivot_price = p
+                last_pivot_idx   = i
+        elif direction == "down":
+            if p < last_pivot_price:
+                last_pivot_price = p
+                last_pivot_idx   = i
+            elif (p - last_pivot_price) / last_pivot_price >= threshold:
+                pivots.append({"idx": last_pivot_idx, "price": last_pivot_price, "type": "low"})
+                direction        = "up"
+                last_pivot_price = p
+                last_pivot_idx   = i
 
-      - name: Commit refreshed JSON
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data_stocks_slim.json data_rebound.json data_watchlist.json
-          if git diff --cached --quiet; then
-            echo "No JSON changes to commit."
-          else
-            git commit -m "Auto refresh ZigZag data"
-            git push
-          fi
+    # Add final pivot
+    ptype = "high" if direction == "up" else "low"
+    if not pivots or pivots[-1]["idx"] != last_pivot_idx:
+        pivots.append({"idx": last_pivot_idx, "price": last_pivot_price, "type": ptype})
+
+    return pivots
+
+
+def compute_metrics(df: pd.DataFrame, pivots: list) -> dict:
+    """
+    From ZigZag pivots, compute rise/drop metrics.
+    
+    Returns dict with:
+        avg_rise_pct, avg_drop_pct, avg_rise_days, avg_drop_days, speed
+        last_swing_low, last_swing_high
+        all pivot prices/indices for level computation
+    """
+    if len(pivots) < 3:
+        return {}
+
+    rises, drops = [], []
+    rise_days_list, drop_days_list = [], []
+
+    for i in range(len(pivots) - 1):
+        a, b = pivots[i], pivots[i + 1]
+        days  = b["idx"] - a["idx"]
+        pct   = (b["price"] - a["price"]) / a["price"] * 100
+
+        if a["type"] == "low" and b["type"] == "high":
+            rises.append(pct)
+            rise_days_list.append(days)
+        elif a["type"] == "high" and b["type"] == "low":
+            drops.append(pct)
+            drop_days_list.append(days)
+
+    avg_rise_pct   = round(float(np.mean(rises)),      2) if rises      else 0.0
+    avg_drop_pct   = round(float(np.mean(drops)),      2) if drops      else 0.0
+    avg_rise_days  = round(float(np.mean(rise_days_list)), 1) if rise_days_list else 0.0
+    avg_drop_days  = round(float(np.mean(drop_days_list)), 1) if drop_days_list else 0.0
+    speed          = round(avg_rise_pct / avg_rise_days, 4) if avg_rise_days > 0 else 0.0
+
+    lows  = [p for p in pivots if p["type"] == "low"]
+    highs = [p for p in pivots if p["type"] == "high"]
+
+    last_swing_low  = round(lows[-1]["price"],  2) if lows  else None
+    last_swing_high = round(highs[-1]["price"], 2) if highs else None
+
+    return {
+        "avg_rise_pct":   avg_rise_pct,
+        "avg_drop_pct":   avg_drop_pct,
+        "avg_rise_days":  avg_rise_days,
+        "avg_drop_days":  avg_drop_days,
+        "speed":          speed,
+        "last_swing_low": last_swing_low,
+        "last_swing_high":last_swing_high,
+        "cycle_count":    len(rises),
+    }
+
+
+def compute_levels(metrics: dict) -> dict:
+    """
+    Compute buy levels, stop loss, targets from metrics.
+    
+    L1 = last swing low
+    L2 = L1 - 15% of avg_drop depth
+    L3 = L1 - 30% of avg_drop depth
+    SL = L3 * 0.95
+    Target = last swing high OR L1 * (1 + avg_rise_pct/100)
+    """
+    l1 = metrics.get("last_swing_low")
+    if l1 is None:
+        return {}
+
+    avg_drop_abs = abs(metrics.get("avg_drop_pct", 20)) / 100
+    l2 = round(l1 * (1 - avg_drop_abs * L2_DROP_FACTOR), 2)
+    l3 = round(l1 * (1 - avg_drop_abs * L3_DROP_FACTOR), 2)
+    sl = round(l3 * (1 - STOP_LOSS_BUFFER), 2)
+
+    swing_high = metrics.get("last_swing_high")
+    avg_rise   = metrics.get("avg_rise_pct", 35)
+    if swing_high and swing_high > l1:
+        target = round(swing_high, 2)
+    else:
+        target = round(l1 * (1 + avg_rise / 100), 2)
+
+    return {"l1": l1, "l2": l2, "l3": l3, "stop_loss": sl, "target": target}
+
+
+def is_bouncing(df: pd.DataFrame, pivots: list, current_price: float, lookback: int = 5) -> tuple:
+    """
+    Detect if stock is bouncing off a recent low.
+    Returns (is_bouncing: bool, bounce_day: int | None)
+    bounce_day = how many days ago it started bouncing
+    """
+    if not pivots or current_price is None:
+        return False, None
+
+    lows = [p for p in pivots if p["type"] == "low"]
+    if not lows:
+        return False, None
+
+    last_low     = lows[-1]
+    last_low_idx = last_low["idx"]
+    n            = len(df)
+    days_since   = n - 1 - last_low_idx
+
+    # Bouncing = within last 20 trading days AND price > low by at least 2%
+    if 0 <= days_since <= 20:
+        bounce_pct = (current_price - last_low["price"]) / last_low["price"] * 100
+        if bounce_pct >= 2.0:
+            return True, int(days_since)
+
+    return False, None
+
+
+# ─────────────────────────────────────────────
+# ANALYSIS CORE
+# ─────────────────────────────────────────────
+
+def analyse_stock(symbol: str, exchange: str = "NSE") -> dict | None:
+    """
+    Full analysis pipeline for one stock.
+    Includes adaptive fallbacks for new listings and thin-data stocks:
+      - History:  3yr → 2yr → 1yr
+      - Threshold: 8% → 5% → 3%
+      - Min pivots: 3 (was 4)
+    Returns enriched dict or None on failure.
+    """
+    ticker = resolve_ticker(symbol, exchange)
+    log.info(f"  Analysing {symbol} ({ticker})")
+
+    time.sleep(REQUEST_DELAY)
+
+    # 1. Current price
+    price = fetch_current_price(ticker)
+    if price is None:
+        log.warning(f"  ✗ Could not get price for {symbol}. Skipping.")
+        return None
+
+    # 2. Historical data — adaptive window
+    df, years_used = fetch_history(ticker)
+    if df is None:
+        log.warning(f"  ✗ No history for {symbol} (tried all windows). Skipping.")
+        return None
+
+    # 3. ZigZag — adaptive threshold
+    # Try primary threshold, then fall back to finer ones for low-volatility
+    # or short-history stocks (MTAR listed 2021, Walchandnagar sparse)
+    pivots = []
+    threshold_used = ZIGZAG_THRESHOLD
+    all_thresholds = [ZIGZAG_THRESHOLD] + ZIGZAG_FALLBACKS
+
+    for thresh in all_thresholds:
+        pivots = compute_zigzag(df["close"], threshold=thresh)
+        if len(pivots) >= MIN_PIVOTS:
+            if thresh != ZIGZAG_THRESHOLD:
+                log.info(f"    ↳ Using {thresh*100:.0f}% ZigZag threshold ({len(pivots)} pivots)")
+            threshold_used = thresh
+            break
+
+    if len(pivots) < MIN_PIVOTS:
+        log.warning(
+            f"  ✗ Too few pivots for {symbol} even at "
+            f"{all_thresholds[-1]*100:.0f}% threshold "
+            f"({len(pivots)} pivots, {len(df)} bars). Skipping."
+        )
+        return None
+
+    # Tag data quality so dashboard can show a warning icon
+    data_quality = "full" if years_used >= HISTORY_YEARS and threshold_used == ZIGZAG_THRESHOLD else "limited"
+
+    # 4. Metrics & levels
+    metrics = compute_metrics(df, pivots)
+    if not metrics:
+        return None
+
+    levels = compute_levels(metrics)
+    if not levels:
+        return None
+
+    # 5. Derived metrics
+    l1 = levels["l1"]
+    target = levels["target"]
+    distance_from_buy_zone = round((price / l1 - 1) * 100, 2) if l1 else None
+    upside_pct             = round((target / price - 1) * 100, 2) if target and price else None
+    speed                  = metrics.get("speed")
+
+    # 6. Bounce detection
+    bouncing, bounce_day = is_bouncing(df, pivots, price)
+
+    # 7. Timing
+    avg_rise_days = metrics.get("avg_rise_days", 0)
+    cycle_days    = avg_rise_days + metrics.get("avg_drop_days", 0)
+    rotations_per_year = round(252 / cycle_days, 2) if cycle_days > 0 else None
+    days_to_target = round(avg_rise_days - (bounce_day or 0), 0) if bouncing and avg_rise_days else None
+
+    return {
+        "current_price":         price,
+        "avg_rise_pct":          metrics["avg_rise_pct"],
+        "avg_drop_pct":          metrics["avg_drop_pct"],
+        "avg_rise_days":         metrics["avg_rise_days"],
+        "avg_drop_days":         metrics["avg_drop_days"],
+        "speed":                 speed,
+        "last_swing_low":        metrics["last_swing_low"],
+        "last_swing_high":       metrics["last_swing_high"],
+        "cycle_count":           metrics["cycle_count"],
+        "data_quality":          data_quality,
+        "history_years":         years_used,
+        "zigzag_threshold_used": threshold_used,
+        "l1":                    levels["l1"],
+        "l2":                    levels["l2"],
+        "l3":                    levels["l3"],
+        "stop_loss":             levels["stop_loss"],
+        "crash_buy_l1":          levels["l1"],
+        "rotation_target":       target,
+        "target":                target,
+        "distance_from_buy_zone": distance_from_buy_zone,
+        "distance_from_l1":      distance_from_buy_zone,
+        "upside_pct":            upside_pct,
+        "is_bouncing":           bouncing,
+        "bounce_day":            bounce_day,
+        "days_to_target":        days_to_target,
+        "rotations_per_year":    rotations_per_year,
+        "last_updated":          datetime.now().isoformat(),
+    }
+
+
+# ─────────────────────────────────────────────
+# JSON UPDATERS
+# ─────────────────────────────────────────────
+
+def update_stocks_slim(dry_run: bool = False, target_symbol: str = None):
+    path = DATA_DIR / "data_stocks_slim.json"
+    with open(path) as f:
+        stocks = json.load(f)
+
+    updated, failed = 0, 0
+    for stock in stocks:
+        sym = stock["symbol"]
+        if target_symbol and sym != target_symbol:
+            continue
+
+        result = analyse_stock(sym, stock.get("exchange", "NSE"))
+        if result is None:
+            failed += 1
+            continue
+
+        # Overwrite calculated fields; preserve manual fields (tier, score)
+        stock.update({
+            "current_price":         result["current_price"],
+            "avg_rise_pct":          result["avg_rise_pct"],
+            "avg_drop_pct":          result["avg_drop_pct"],
+            "avg_rise_days":         result["avg_rise_days"],
+            "avg_drop_days":         result["avg_drop_days"],
+            "speed":                 result["speed"],
+            "crash_buy_l1":          result["crash_buy_l1"],
+            "l2":                    result["l2"],
+            "l3":                    result["l3"],
+            "stop_loss":             result["stop_loss"],
+            "rotation_target":       result["rotation_target"],
+            "distance_from_buy_zone":result["distance_from_buy_zone"],
+            "upside_pct":            result["upside_pct"],
+            "data_quality":          result.get("data_quality", "full"),
+            "history_years":         result.get("history_years"),
+            "zigzag_threshold":      result.get("zigzag_threshold_used"),
+            "last_updated":          result["last_updated"],
+        })
+        updated += 1
+
+    out_path = DATA_DIR / "data_stocks_slim.refreshed.json"
+    with open(out_path, "w") as f:
+        json.dump(stocks, f, indent=2)
+
+    if not dry_run:
+        with open(path, "w") as f:
+            json.dump(stocks, f, indent=2)
+        log.info(f"  ✔ stocks_slim updated → {updated} ok, {failed} skipped")
+    else:
+        log.info(f"  [DRY RUN] stocks_slim → {updated} ok, {failed} skipped. Refreshed file written.")
+
+    return stocks
+
+
+def update_rebound(dry_run: bool = False, target_symbol: str = None):
+    path = DATA_DIR / "data_rebound.json"
+    with open(path) as f:
+        stocks = json.load(f)
+
+    updated, failed = 0, 0
+    for stock in stocks:
+        sym = stock["symbol"]
+        if target_symbol and sym != target_symbol:
+            continue
+
+        result = analyse_stock(sym, stock.get("exchange", "NSE"))
+        if result is None:
+            failed += 1
+            continue
+
+        stock.update({
+            "current_price":      result["current_price"],
+            "l1":                 result["l1"],
+            "l2":                 result["l2"],
+            "l3":                 result["l3"],
+            "target":             result["target"],
+            "stop_loss":          result["stop_loss"],
+            "avg_rise_days":      result["avg_rise_days"],
+            "avg_drop_days":      result["avg_drop_days"],
+            "speed":              result["speed"],
+            "last_swing_low":     result["last_swing_low"],
+            "last_swing_high":    result["last_swing_high"],
+            "is_bouncing":        result["is_bouncing"],
+            "bounce_day":         result["bounce_day"],
+            "days_to_target":     result["days_to_target"],
+            "rotations_per_year": result["rotations_per_year"],
+            "upside_pct":         result["upside_pct"],
+            "distance_from_l1":   result["distance_from_l1"],
+            "data_quality":       result.get("data_quality", "full"),
+            "history_years":      result.get("history_years"),
+            "zigzag_threshold":   result.get("zigzag_threshold_used"),
+            "last_updated":       result["last_updated"],
+        })
+        updated += 1
+
+    out_path = DATA_DIR / "data_rebound.refreshed.json"
+    with open(out_path, "w") as f:
+        json.dump(stocks, f, indent=2)
+
+    if not dry_run:
+        with open(path, "w") as f:
+            json.dump(stocks, f, indent=2)
+        log.info(f"  ✔ rebound updated → {updated} ok, {failed} skipped")
+    else:
+        log.info(f"  [DRY RUN] rebound → {updated} ok, {failed} skipped")
+
+    return stocks
+
+
+def update_watchlist(dry_run: bool = False, target_symbol: str = None):
+    path = DATA_DIR / "data_watchlist.json"
+    with open(path) as f:
+        stocks = json.load(f)
+
+    updated, failed = 0, 0
+    for stock in stocks:
+        sym = stock["symbol"]
+        if target_symbol and sym != target_symbol:
+            continue
+
+        ticker = resolve_ticker(sym, stock.get("exchange", "NSE"))
+        time.sleep(REQUEST_DELAY)
+        price = fetch_current_price(ticker)
+
+        if price is None:
+            failed += 1
+            continue
+
+        entry  = stock.get("entry") or 0
+        target = stock.get("target") or 0
+        sl     = stock.get("stop_loss") or 0
+        qty    = stock.get("quantity") or 1
+
+        pnl        = round((price - entry) * qty, 2) if entry else None
+        pnl_pct    = round((price / entry - 1) * 100, 2) if entry else None
+        upside_pct = round((target / price - 1) * 100, 2) if target and price else None
+        risk       = abs(entry - sl) if entry and sl else 1
+        reward     = abs(target - entry) if target and entry else 0
+        rr         = round(reward / risk, 2) if risk > 0 else None
+
+        stock.update({
+            "current_price":       price,
+            "pnl":                 pnl,
+            "pnl_pct":             pnl_pct,
+            "upside_to_target_pct":upside_pct,
+            "risk_reward":         rr,
+            "last_updated":        datetime.now().isoformat(),
+        })
+        updated += 1
+
+    out_path = DATA_DIR / "data_watchlist.refreshed.json"
+    with open(out_path, "w") as f:
+        json.dump(stocks, f, indent=2)
+
+    if not dry_run:
+        with open(path, "w") as f:
+            json.dump(stocks, f, indent=2)
+        log.info(f"  ✔ watchlist updated → {updated} ok, {failed} skipped")
+    else:
+        log.info(f"  [DRY RUN] watchlist → {updated} ok, {failed} skipped")
+
+    return stocks
+
+
+# ─────────────────────────────────────────────
+# SIGNAL GENERATOR
+# ─────────────────────────────────────────────
+
+def generate_signals(stocks_slim: list, rebound: list) -> dict:
+    """
+    Generate top trade ideas and alerts.
+    Returns dict with categorised signals.
+    """
+    buy_zone   = []
+    rebounders = []
+
+    for s in stocks_slim:
+        d = s.get("distance_from_buy_zone")
+        if d is not None and 0 <= d <= NEAR_ZONE_PCT:
+            buy_zone.append({
+                "symbol":   s["symbol"],
+                "tier":     s.get("tier"),
+                "score":    s.get("score"),
+                "price":    s.get("current_price"),
+                "l1":       s.get("crash_buy_l1"),
+                "target":   s.get("rotation_target"),
+                "distance": d,
+                "upside":   s.get("upside_pct"),
+                "speed":    s.get("speed"),
+            })
+
+    for s in rebound:
+        if s.get("is_bouncing"):
+            rebounders.append({
+                "symbol":         s["symbol"],
+                "price":          s.get("current_price"),
+                "target":         s.get("target"),
+                "bounce_day":     s.get("bounce_day"),
+                "days_to_target": s.get("days_to_target"),
+                "speed":          s.get("speed"),
+                "upside":         s.get("upside_pct"),
+                "rotations/yr":   s.get("rotations_per_year"),
+            })
+
+    # Sort
+    buy_zone.sort(key=lambda x: x.get("distance") or 999)
+    rebounders.sort(key=lambda x: -(x.get("speed") or 0))
+
+    signals = {
+        "generated_at": datetime.now().isoformat(),
+        "buy_zone_alerts": buy_zone[:10],
+        "rebound_alerts":  rebounders[:10],
+        "top_ideas":       (buy_zone + rebounders)[:10],
+    }
+
+    sig_path = DATA_DIR / "signals.json"
+    with open(sig_path, "w") as f:
+        json.dump(signals, f, indent=2)
+
+    log.info(f"  ✔ Signals: {len(buy_zone)} near buy zone, {len(rebounders)} bouncing")
+    return signals
+
+
+# ─────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="Stock Analysis Engine")
+    parser.add_argument("--dry-run", action="store_true", help="Don't overwrite originals")
+    parser.add_argument("--symbol",  type=str, default=None, help="Run for a single symbol")
+    args = parser.parse_args()
+
+    log.info("=" * 60)
+    log.info(f"Stock Engine starting — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    log.info(f"Dry run: {args.dry_run} | Symbol filter: {args.symbol or 'ALL'}")
+    log.info("=" * 60)
+
+    try:
+        log.info("\n[1/3] Updating stocks_slim...")
+        stocks_slim = update_stocks_slim(dry_run=args.dry_run, target_symbol=args.symbol)
+    except Exception as e:
+        log.error(f"stocks_slim failed: {e}")
+        stocks_slim = []
+
+    try:
+        log.info("\n[2/3] Updating rebound list...")
+        rebound = update_rebound(dry_run=args.dry_run, target_symbol=args.symbol)
+    except Exception as e:
+        log.error(f"rebound failed: {e}")
+        rebound = []
+
+    try:
+        log.info("\n[3/3] Updating watchlist...")
+        update_watchlist(dry_run=args.dry_run, target_symbol=args.symbol)
+    except Exception as e:
+        log.error(f"watchlist failed: {e}")
+
+    try:
+        log.info("\n[✦] Generating signals...")
+        generate_signals(stocks_slim, rebound)
+    except Exception as e:
+        log.error(f"Signal generation failed: {e}")
+
+    log.info("\n" + "=" * 60)
+    log.info("Stock Engine complete.")
+    log.info("=" * 60)
+
+
+if __name__ == "__main__":
+    main()
