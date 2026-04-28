@@ -1,240 +1,86 @@
-import json
-import time
-from pathlib import Path
+name: Refresh data and deploy to Pages
 
-import pandas as pd
-import yfinance as yf
+on:
+  # Manual trigger from the Actions tab
+  workflow_dispatch:
+  # Run every weekday at 11:30 UTC (~5:00 PM IST, after NSE close)
+  schedule:
+    - cron: "30 11 * * 1-5"
+  # Also rebuild on pushes to main (without re-fetching data)
+  push:
+    branches: [main]
 
-ZIGZAG_THRESHOLD = 0.08
-HISTORY_PERIOD = "3y"
+# Permissions required by the official Pages deploy action
+permissions:
+  contents: read
+  pages: write
+  id-token: write
 
-PRICE_ALIASES = {
-    "QPOWER": ["QPOWER.NS", "QPOWER.BO"],
-    "QUALITYPOWER": ["QPOWER.NS", "QPOWER.BO"],
-    "BANKMAH": ["MAHABANK.NS"],
-    "BOM": ["MAHABANK.NS"],
-}
+# Allow only one concurrent deployment, but don't cancel an in-progress run
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
 
-def load_json(path):
-    p = Path(path)
-    if not p.exists():
-        print(f"Missing {path}")
-        return []
-    return json.loads(p.read_text(encoding="utf-8"))
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
 
-def save_json(path, data):
-    Path(path).write_text(json.dumps(data, indent=2), encoding="utf-8")
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-def tickers_for(sym):
-    sym = str(sym).strip().upper()
-    return PRICE_ALIASES.get(sym, [f"{sym}.NS", f"{sym}.BO"])
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
 
-def fetch_history(sym):
-    for ticker in tickers_for(sym):
-        try:
-            df = yf.Ticker(ticker).history(period=HISTORY_PERIOD, auto_adjust=True)
-            if df is not None and not df.empty and "Close" in df.columns:
-                df = df.dropna(subset=["Close"])
-                if len(df) > 50:
-                    return df
-        except Exception:
-            pass
-    return None
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas yfinance
 
-def zigzag(close, threshold=ZIGZAG_THRESHOLD):
-    prices = close.astype(float)
-    if prices.empty:
-        return []
+      # Only fetch fresh market data on scheduled or manual runs;
+      # plain pushes just redeploy the existing JSON.
+      - name: Refresh stock data
+        if: github.event_name != 'push'
+        run: python refresh.py
 
-    pivots = []
-    start_idx = prices.index[0]
-    start_price = float(prices.iloc[0])
-    trend = None
-    extreme_idx = start_idx
-    extreme_price = start_price
+      - name: Replace JSON
+        if: github.event_name != 'push'
+        run: |
+          if [ -f data_stocks_slim.refreshed.json ]; then cp data_stocks_slim.refreshed.json data_stocks_slim.json; fi
+          if [ -f data_rebound.refreshed.json ];     then cp data_rebound.refreshed.json     data_rebound.json;     fi
+          if [ -f data_watchlist.refreshed.json ];   then cp data_watchlist.refreshed.json   data_watchlist.json;   fi
 
-    for idx, price in prices.iloc[1:].items():
-        price = float(price)
+      # Persist the refreshed JSON back to the repo so subsequent
+      # plain-push deploys serve the latest numbers.
+      - name: Commit refreshed JSON
+        if: github.event_name != 'push'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data_stocks_slim.json data_rebound.json data_watchlist.json
+          if git diff --cached --quiet; then
+            echo "No JSON changes to commit."
+          else
+            git commit -m "chore: refresh stock data [skip ci]"
+            git push
+          fi
 
-        if trend is None:
-            move = price / start_price - 1
-            if move >= threshold:
-                trend = "up"
-                pivots.append((start_idx, start_price, "LOW"))
-                extreme_idx, extreme_price = idx, price
-            elif move <= -threshold:
-                trend = "down"
-                pivots.append((start_idx, start_price, "HIGH"))
-                extreme_idx, extreme_price = idx, price
-            continue
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
 
-        if trend == "up":
-            if price > extreme_price:
-                extreme_idx, extreme_price = idx, price
-            elif price / extreme_price - 1 <= -threshold:
-                pivots.append((extreme_idx, extreme_price, "HIGH"))
-                trend = "down"
-                extreme_idx, extreme_price = idx, price
+      - name: Upload site artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          # Publish the repo root. Change to "./site" or "./dist" if
+          # your HTML lives in a subfolder.
+          path: "."
 
-        elif trend == "down":
-            if price < extreme_price:
-                extreme_idx, extreme_price = idx, price
-            elif price / extreme_price - 1 >= threshold:
-                pivots.append((extreme_idx, extreme_price, "LOW"))
-                trend = "up"
-                extreme_idx, extreme_price = idx, price
-
-    if trend == "up":
-        pivots.append((extreme_idx, extreme_price, "HIGH"))
-    elif trend == "down":
-        pivots.append((extreme_idx, extreme_price, "LOW"))
-
-    return pivots
-
-def calc_stats(df):
-    close = df["Close"].dropna()
-    live = round(float(close.iloc[-1]), 2)
-    pivots = zigzag(close)
-
-    rises, drops, rise_days, drop_days = [], [], [], []
-
-    for a, b in zip(pivots[:-1], pivots[1:]):
-        a_date, a_price, a_type = a
-        b_date, b_price, b_type = b
-        days = max(1, (pd.Timestamp(b_date) - pd.Timestamp(a_date)).days)
-
-        if a_type == "LOW" and b_type == "HIGH":
-            rises.append((b_price / a_price - 1) * 100)
-            rise_days.append(days)
-
-        if a_type == "HIGH" and b_type == "LOW":
-            drops.append((a_price / b_price - 1) * 100)
-            drop_days.append(days)
-
-    avg_rise = round(sum(rises) / len(rises), 2) if rises else 0
-    avg_drop = round(sum(drops) / len(drops), 2) if drops else 0
-    rd = int(round(sum(rise_days) / len(rise_days), 0)) if rise_days else 0
-    dd = int(round(sum(drop_days) / len(drop_days), 0)) if drop_days else 0
-    speed = round(avg_rise / rd, 2) if rd else 0
-
-    last_low = None
-    last_high = None
-
-    for _, price, ptype in reversed(pivots):
-        if ptype == "LOW" and last_low is None:
-            last_low = price
-        if ptype == "HIGH" and last_high is None:
-            last_high = price
-        if last_low and last_high:
-            break
-
-    crash_buy = round(last_low, 2) if last_low else 0
-    rot_target = round(last_high, 2) if last_high else round(live * (1 + avg_rise / 100), 2)
-
-    l1 = crash_buy
-    l2 = round(crash_buy * (1 - avg_drop * 0.15 / 100), 2) if crash_buy else 0
-    l3 = round(crash_buy * (1 - avg_drop * 0.30 / 100), 2) if crash_buy else 0
-    sl = round(l3 * 0.95, 2) if l3 else 0
-
-    dist = round((live / l1 - 1) * 100, 2) if l1 else 0
-    up = round((rot_target / live - 1) * 100, 2) if live and rot_target else 0
-
-    return {
-        "live": live,
-        "avg_rise": avg_rise,
-        "avg_drop": avg_drop,
-        "rise_days": rd,
-        "drop_days": dd,
-        "speed": speed,
-        "crash_buy": l1,
-        "l1": l1,
-        "l2": l2,
-        "l3": l3,
-        "sl": sl,
-        "rot_target": rot_target,
-        "target": rot_target,
-        "dist": dist,
-        "up_scan": up,
-    }
-
-def main():
-    stocks = load_json("data_stocks_slim.json")
-    rebound = load_json("data_rebound.json")
-    watchlist = load_json("data_watchlist.json")
-
-    symbols = set()
-
-    for r in stocks:
-        if r.get("s"):
-            symbols.add(str(r["s"]).upper())
-
-    for r in rebound:
-        if r.get("sym"):
-            symbols.add(str(r["sym"]).upper())
-
-    for r in watchlist:
-        if r.get("sym"):
-            symbols.add(str(r["sym"]).upper())
-
-    stats = {}
-
-    for i, sym in enumerate(sorted(symbols), 1):
-        df = fetch_history(sym)
-        if df is None:
-            print(f"{i}/{len(symbols)} {sym}: no data")
-            continue
-
-        try:
-            stats[sym] = calc_stats(df)
-            print(
-                f"{i}/{len(symbols)} {sym}: "
-                f"price={stats[sym]['live']} "
-                f"rise_days={stats[sym]['rise_days']} "
-                f"drop_days={stats[sym]['drop_days']}"
-            )
-        except Exception as e:
-            print(f"{sym}: failed {e}")
-
-        time.sleep(0.15)
-
-    for r in stocks:
-        sym = str(r.get("s", "")).upper()
-        if sym in stats:
-            s = stats[sym]
-            r["px"] = s["live"]
-            r["ad"] = s["avg_drop"]
-            r["cb"] = s["crash_buy"]
-            r["rt"] = s["rot_target"]
-            r["rd"] = s["rise_days"]
-            r["dd"] = s["drop_days"]
-            r["sp"] = s["speed"]
-
-    for r in rebound:
-        sym = str(r.get("sym", "")).upper()
-        if sym in stats:
-            s = stats[sym]
-            r["price"] = s["live"]
-            r["target"] = s["target"]
-            r["dist"] = s["dist"]
-            r["speed"] = s["speed"]
-            r["l1"] = s["l1"]
-            r["l2"] = s["l2"]
-            r["l3"] = s["l3"]
-            r["sl"] = s["sl"]
-            r["rdays"] = s["rise_days"]
-            r["ddays"] = s["drop_days"]
-            r["up_scan"] = s["up_scan"]
-
-    for r in watchlist:
-        sym = str(r.get("sym", "")).upper()
-        if sym in stats:
-            r["live"] = stats[sym]["live"]
-
-    save_json("data_stocks_slim.refreshed.json", stocks)
-    save_json("data_rebound.refreshed.json", rebound)
-    save_json("data_watchlist.refreshed.json", watchlist)
-
-    print("Refresh complete")
-
-if __name__ == "__main__":
-    main()
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
