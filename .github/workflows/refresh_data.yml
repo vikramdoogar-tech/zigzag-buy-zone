@@ -1,4 +1,98 @@
-name: Refresh ZigZag Data
+name: 📈 Daily Stock Update
+
+on:
+  schedule:
+    # Runs at 16:30 UTC = 22:00 IST (after NSE close at 15:30 IST)
+    - cron: '30 16 * * 1-5'   # Mon–Fri only
+
+  # Allow manual trigger from GitHub UI
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (no file overwrite)?'
+        required: false
+        default: 'false'
+        type: boolean
+      symbol:
+        description: 'Single symbol to refresh (leave blank for ALL)'
+        required: false
+        default: ''
+
+jobs:
+  update-stocks:
+    name: Refresh Stock Data
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    permissions:
+      contents: write   # needed to push updated JSON files back
+
+    steps:
+      # ─────────────────────────────────────────
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # ─────────────────────────────────────────
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      # ─────────────────────────────────────────
+      - name: 📦 Install dependencies
+        run: pip install -r requirements.txt
+
+      # ─────────────────────────────────────────
+      - name: 🔄 Run stock update engine
+        run: |
+          python update_stocks.py \
+            ${{ github.event.inputs.dry_run == 'true' && '--dry-run' || '' }} \
+            ${{ github.event.inputs.symbol != '' && format('--symbol {0}', github.event.inputs.symbol) || '' }}
+
+      # ─────────────────────────────────────────
+      - name: 📤 Commit updated JSON files
+        if: github.event.inputs.dry_run != 'true'
+        run: |
+          git config user.name  "Stock Engine Bot"
+          git config user.email "stock-engine@noreply.github.com"
+
+          git add data/data_stocks_slim.json \
+                  data/data_rebound.json \
+                  data/data_watchlist.json \
+                  data/signals.json \
+                  data/data_stocks_slim.refreshed.json \
+                  data/data_rebound.refreshed.json \
+                  data/data_watchlist.refreshed.json \
+                  logs/ || true
+
+          git diff --staged --quiet || \
+            git commit -m "📊 Auto-update: $(date '+%Y-%m-%d %H:%M IST')"
+
+          git push
+
+      # ─────────────────────────────────────────
+      - name: 📋 Upload logs as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stock-engine-logs-${{ github.run_id }}
+          path: logs/
+          retention-days: 14
+
+      # ─────────────────────────────────────────
+      - name: ✅ Summary
+        run: |
+          echo "### 📈 Stock Update Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- Run time: $(date '+%Y-%m-%d %H:%M UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "- Dry run: ${{ github.event.inputs.dry_run || 'false' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Symbol filter: ${{ github.event.inputs.symbol || 'ALL' }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Updated files:" >> $GITHUB_STEP_SUMMARY
+          for f in data/*.json; do echo "  - $f"; done >> $GITHUB_STEP_SUMMARYname: Refresh ZigZag Data
 
 on:
   workflow_dispatch:
